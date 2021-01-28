@@ -4,7 +4,7 @@
 // Modules.
 mod ansi;
 pub mod error;
-pub mod lex; // TODO: Remove pub.
+pub(crate) mod lex;
 
 // Exports.
 pub use error::Error;
@@ -21,7 +21,7 @@ use std::fmt::{Display, Formatter};
 ///
 /// To create the optimized sequence, the [ToString] trait or [Display] trait should be used:
 ///
-/// ```
+/// ```text
 /// # use ansi_optimizer::Optimizer;
 /// let mut optimizer = Optimizer::new();
 /// optimizer.update("\x1B[33;41m");

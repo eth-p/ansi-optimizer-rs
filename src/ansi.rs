@@ -2,9 +2,10 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::lex::Lexer;
 use std::str::FromStr;
+use std::sync::atomic::Ordering::SeqCst;
 
 /// An ANSI escape sequence.
-#[derive(Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum Sequence<'a> {
     CSI(ControlSequence<'a>),
     OSC(AnsiSequence<'a>, AnsiString<'a>),
@@ -16,7 +17,7 @@ pub enum Sequence<'a> {
 /// ```text
 /// ESC I* F
 /// ```
-#[derive(PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub struct AnsiSequence<'a> {
     intermediates: &'a str,
     finalizer: &'a str,
@@ -33,7 +34,7 @@ pub struct AnsiSequence<'a> {
 /// ```text
 /// P* I* F
 /// ```
-#[derive(Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub struct ControlSequence<'a> {
     parameters: &'a str,
     intermediates: &'a str,
@@ -44,7 +45,7 @@ pub struct ControlSequence<'a> {
 ///
 /// This is implicitly created by a preceding sequence.
 /// The string is terminated by `ESC '\'`, or `BEL`.
-#[derive(Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub struct AnsiString<'a> {
     text: &'a str,
     finalizer: &'a str,
@@ -68,6 +69,60 @@ impl<'a> Parse<'a> for AnsiSequence<'a> {
         })
     }
 }
+
+impl<'a> Parse<'a> for ControlSequence<'a> {
+    fn parse(lexer: &mut Lexer<'a>) -> Result<Self> {
+        lexer.extract_one(is_sequence_opener)?;
+
+        match lexer.extract_one_greedy(is_csi_finalizer)? {
+            "[" => Ok(ControlSequence {
+                parameters: lexer.extract(is_csi_parameter)?,
+                intermediates: lexer.extract(is_csi_intermediate)?,
+                finalizer: lexer.extract_one_greedy(is_csi_finalizer)?,
+            }),
+            _ => Err(Error::InvalidSequence),
+        }
+        
+    }
+}
+
+impl<'a> Parse<'a> for AnsiString<'a> {
+    fn parse(lexer: &mut Lexer<'a>) -> Result<Self> {
+        let text = lexer.extract(|c| !is_st_opener(c))?;
+        let finalizer = match lexer.extract_one_greedy(is_st_opener)? {
+            "\x07" => "\x07",
+            "\x1B" => if lexer.extract_one_greedy(|c| c == '\\')? == "\\" {
+                "\x1B\\"
+            } else {
+                return Err(Error::InvalidSequence);
+            },
+            _ => return Err(Error::InvalidSequence),
+        };
+
+        Ok(AnsiString {
+            text,
+            finalizer,
+        })
+    }
+}
+
+impl<'a> Parse<'a> for Sequence<'a> {
+    fn parse(lexer: &mut Lexer<'a>) -> Result<Self> {
+        let mut lookahead_lexer = lexer.clone();
+        let lookahead = AnsiSequence::parse(&mut lookahead_lexer)?;
+        
+        if lookahead.intermediates.is_empty() {
+            return Ok(match lookahead.finalizer {
+                "[" => Sequence::CSI(ControlSequence::parse(lexer)?), 
+                "]" => Sequence::OSC(AnsiSequence::parse(lexer)?, AnsiString::parse(lexer)?),
+                _ => Sequence::Regular(AnsiSequence::parse(lexer)?)
+            })
+        }
+        
+        Ok(Sequence::Regular(AnsiSequence::parse(lexer)?))
+    }
+}
+
 
 // -------------------------------------------------------------------------------------------------
 
@@ -133,6 +188,14 @@ pub(crate) fn is_csi_intermediate(c: char) -> bool {
     }
 }
 
+/// Checks if a character is an opener for the ST sequence.
+/// 
+/// On xterm, this is either `ESC \`, or BEL. 
+pub(crate) fn is_st_opener(c: char) -> bool {
+    c == '\x07' || is_sequence_opener(c)
+}
+
+
 // -------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -166,11 +229,107 @@ mod tests {
     }
 
     #[test]
+    fn parse_csi_sequence() {
+        let mut lex = Lexer::new("\x1B[33m\x1B[48;5;105m");
+
+        // Parse valid `ESC [ 33 m` sequence.
+        assert_eq!(
+            ControlSequence::parse(&mut lex),
+            Ok(ControlSequence {
+                parameters: "33",
+                intermediates: "",
+                finalizer: "m",
+            })
+        );
+
+        // Parse valid `ESC [ 48;5;105 m` sequence.
+        assert_eq!(
+            ControlSequence::parse(&mut lex),
+            Ok(ControlSequence {
+                parameters: "48;5;105",
+                intermediates: "",
+                finalizer: "m",
+            })
+        );
+
+        // Ensure nothing is left to read.
+        assert!(lex.is_empty());
+    }
+
+    #[test]
+    fn parse_string_sequence() {
+        let mut lex = Lexer::new("Test\x1B\\Strings\x07\x1B[33m");
+
+        // Parse valid `... ESC \\` sequence.
+        assert_eq!(
+            AnsiString::parse(&mut lex),
+            Ok(AnsiString {
+                text: "Test",
+                finalizer: "\x1B\\",
+            })
+        );
+
+        // Parse valid `... BEL` sequence.
+        assert_eq!(
+            AnsiString::parse(&mut lex),
+            Ok(AnsiString {
+                text: "Strings",
+                finalizer: "\x07",
+            })
+        );
+        
+        // Parse invalid string sequence.
+        assert_eq!(
+            AnsiString::parse(&mut lex),
+            Err(Error::InvalidSequence)
+        );
+    }
+
+    #[test]
     fn parse_invalid_sequence() {
         let mut lex = Lexer::new("\x1B\x1B");
         assert_eq!(AnsiSequence::parse(&mut lex), Err(Error::InvalidSequence));
         assert_eq!(lex.remaining(), "");
     }
 
-    // TODO: extract() test, with unicode.
+
+    #[test]
+    fn parse_sequences() {
+        let mut lex = Lexer::new("\x1B7\x1B[38;2;10;25;255m\x1B]0;Title\x07");
+
+        // Parse regular sequence.
+        assert_eq!(
+            Sequence::parse(&mut lex),
+            Ok(Sequence::Regular(AnsiSequence {
+                intermediates: "",
+                finalizer: "7",
+            }))
+        );
+
+        // Parse CSI sequence.
+        assert_eq!(
+            Sequence::parse(&mut lex),
+            Ok(Sequence::CSI(ControlSequence {
+                parameters: "38;2;10;25;255",
+                intermediates: "",
+                finalizer: "m",
+            }))
+        );
+
+        // Parse OSC sequence.
+        assert_eq!(
+            Sequence::parse(&mut lex),
+            Ok(Sequence::OSC(AnsiSequence {
+                intermediates: "",
+                finalizer: "]",
+            }, AnsiString {
+                text: "0;Title",
+                finalizer: "\x07"
+            }))
+        );
+
+        // Ensure nothing is left to read.
+        assert!(lex.is_empty());
+    }
+    
 }
